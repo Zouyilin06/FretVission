@@ -56,7 +56,7 @@ def enumerate_audio_devices() -> list[AudioDevice]:
 class AudioRingBuffer:
     """Thread-safe circular float32 buffer for real-time audio windows."""
 
-    def __init__(self, capacity: int = 16384) -> None:
+    def __init__(self, capacity: int = 32768) -> None:
         self.capacity = int(capacity)
         self._buf = np.zeros(self.capacity, dtype=np.float32)
         self._write_pos = 0
@@ -84,21 +84,24 @@ class AudioRingBuffer:
                 self._write_pos = end % self.capacity
             self._total_written += n
 
-    def read_latest(self, n_samples: int) -> np.ndarray:
-        """Return the most recent n_samples (zero-padded on the left if underfilled)."""
+    def read_latest(self, n_samples: int, delay_samples: int = 0) -> np.ndarray:
+        """Return n_samples ending delay_samples before the write head."""
         n = min(int(n_samples), self.capacity)
+        delay = max(0, int(delay_samples))
         with self._lock:
-            avail = min(n, self._total_written)
             out = np.zeros(n, dtype=np.float32)
-            if avail == 0:
+            usable = min(self._total_written, self.capacity) - delay
+            if usable <= 0 or n <= 0:
                 return out
-            start = (self._write_pos - avail) % self.capacity
-            if start < self._write_pos:
-                out[n - avail :] = self._buf[start : self._write_pos]
+            avail = min(n, usable)
+            end_pos = (self._write_pos - delay) % self.capacity
+            start = (end_pos - avail) % self.capacity
+            if start < end_pos:
+                out[n - avail :] = self._buf[start:end_pos]
             else:
                 first = self.capacity - start
                 out[n - avail : n - avail + first] = self._buf[start:]
-                out[n - avail + first :] = self._buf[: self._write_pos]
+                out[n - avail + first :] = self._buf[:end_pos]
             return out
 
     @property
@@ -120,7 +123,7 @@ class AudioSource:
         self.preferred_sample_rate = int(preferred_sample_rate)
         self.hop_size = int(hop_size)
         self.sample_rate: int = self.preferred_sample_rate
-        self.ring = AudioRingBuffer(capacity=16384)
+        self.ring = AudioRingBuffer(capacity=32768)
 
         self._stream: sd.InputStream | None = None
         self._last_error: str | None = None
@@ -167,9 +170,10 @@ class AudioSource:
         if indata.size > 0:
             self.ring.push(indata[:, 0])
 
-    def read_window(self, n_samples: int = 4096) -> np.ndarray:
-        """Return latest mono audio samples."""
-        return self.ring.read_latest(n_samples)
+    def read_window(self, n_samples: int = 4096, delay_ms: float = 0.0) -> np.ndarray:
+        """Return latest mono audio samples, optionally delayed by delay_ms for AV sync."""
+        delay_samples = int(round(max(0.0, float(delay_ms)) * self.sample_rate / 1000.0))
+        return self.ring.read_latest(n_samples, delay_samples=delay_samples)
 
     @property
     def last_error(self) -> str | None:

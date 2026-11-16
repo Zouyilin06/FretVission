@@ -166,9 +166,7 @@ class HandTracker:
         fretting_hand_idx = self._select_fretting_hand(all_hands_px, fretboard)
         fretting_pts = all_hands_px[fretting_hand_idx]
 
-        fingers: list[FingerObservation] = []
-        press_matrix = np.zeros((6, self.max_fret + 1), dtype=np.float32)
-
+        smoothed_tips: dict[str, tuple[float, float]] = {}
         for label, lm_idx in FINGERTIP_LANDMARKS.items():
             raw_x, raw_y = fretting_pts[lm_idx]
             prev = self._smoothed_px.get(label)
@@ -178,24 +176,48 @@ class HandTracker:
             else:
                 sx, sy = raw_x, raw_y
             self._smoothed_px[label] = (sx, sy)
+            smoothed_tips[label] = (sx, sy)
 
-            if fretboard is None:
-                fingers.append(
-                    FingerObservation(
-                        finger_label=label,
-                        pixel_xy=(sx, sy),
-                        string_float=-1.0,
-                        fret_float=-1.0,
-                        string_idx=None,
-                        fret_idx=None,
-                        in_bounds=False,
-                        confidence=0.9,
-                    )
+        base_result = HandTrackingResult(
+            hand_present=True,
+            landmarks_px=fretting_pts,
+            hand_bboxes=bboxes,
+            fingers=[
+                FingerObservation(
+                    finger_label=label,
+                    pixel_xy=xy,
+                    string_float=-1.0,
+                    fret_float=-1.0,
+                    string_idx=None,
+                    fret_idx=None,
+                    in_bounds=False,
+                    confidence=0.9,
                 )
-                continue
+                for label, xy in smoothed_tips.items()
+            ],
+            press_prob_matrix=empty_matrix,
+            model_ready=True,
+        )
+        if fretboard is not None:
+            return self.project_to_fretboard(base_result, fretboard)
+        return base_result
 
+    def project_to_fretboard(
+        self,
+        result: HandTrackingResult,
+        fretboard: FretboardModel,
+    ) -> HandTrackingResult:
+        """Project hand landmarks and barre likelihood onto an updated FretboardModel."""
+        if not result.hand_present:
+            return result
+
+        press_matrix = np.zeros((6, self.max_fret + 1), dtype=np.float32)
+        fingers: list[FingerObservation] = []
+
+        for prev_obs in result.fingers:
+            sx, sy = prev_obs.pixel_xy
+            label = prev_obs.finger_label
             mapped = fretboard.map_image_point(sx, sy)
-            # Thumb mostly sits above Low-E edge (or wraps over Low-E string 0)
             if label == "T" and mapped.in_bounds and mapped.continuous_string > 1.2:
                 in_bounds_effective = False
             else:
@@ -209,7 +231,7 @@ class HandTracker:
                 string_idx=mapped.string_idx if in_bounds_effective else None,
                 fret_idx=mapped.fret_idx if in_bounds_effective else None,
                 in_bounds=in_bounds_effective,
-                confidence=0.9,
+                confidence=prev_obs.confidence,
             )
             fingers.append(obs)
 
@@ -221,17 +243,17 @@ class HandTracker:
                     peak=1.0 if label != "T" else 0.7,
                 )
 
-        # Barre chord detection across index finger segments (MCP 5 -> PIP 6 -> DIP 7 -> TIP 8)
-        if fretboard is not None:
-            self._apply_barre_likelihood(press_matrix, fretting_pts, fretboard)
+        if len(result.landmarks_px) >= 21:
+            self._apply_barre_likelihood(press_matrix, result.landmarks_px, fretboard)
 
         return HandTrackingResult(
             hand_present=True,
-            landmarks_px=fretting_pts,
-            hand_bboxes=bboxes,
+            landmarks_px=result.landmarks_px,
+            hand_bboxes=result.hand_bboxes,
             fingers=fingers,
             press_prob_matrix=np.clip(press_matrix, 0.0, 1.0),
-            model_ready=True,
+            model_ready=result.model_ready,
+            error_message=result.error_message,
         )
 
     @staticmethod

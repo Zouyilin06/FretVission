@@ -181,6 +181,10 @@ class MainWindow(QMainWindow):
         self.calibrate_btn.setObjectName("PrimaryBtn")
         row2.addWidget(self.calibrate_btn)
 
+        self.adjust_corners_btn = QPushButton("Adjust Corners")
+        self.adjust_corners_btn.setCheckable(True)
+        row2.addWidget(self.adjust_corners_btn)
+
         self.auto_guess_btn = QPushButton("Auto-Guess Neck")
         row2.addWidget(self.auto_guess_btn)
 
@@ -190,6 +194,15 @@ class MainWindow(QMainWindow):
 
         self.snap_anchor_btn = QPushButton("Re-Snap Neck")
         row2.addWidget(self.snap_anchor_btn)
+
+        row2.addWidget(QLabel("AV Sync:"))
+        self.av_sync_spin = QSpinBox()
+        self.av_sync_spin.setRange(-300, 300)
+        self.av_sync_spin.setSingleStep(15)
+        self.av_sync_spin.setSuffix(" ms")
+        self.av_sync_spin.setValue(int(self.config.av_sync_offset_ms))
+        self.av_sync_spin.setToolTip("Positive if phone/camera video lags behind microphone audio")
+        row2.addWidget(self.av_sync_spin)
 
         self.reset_key_btn = QPushButton("Reset Key")
         row2.addWidget(self.reset_key_btn)
@@ -381,12 +394,15 @@ class MainWindow(QMainWindow):
         self.handed_combo.currentIndexChanged.connect(self._on_guitar_changed)
 
         self.calibrate_btn.clicked.connect(self._on_start_calibration)
+        self.adjust_corners_btn.toggled.connect(self.camera_widget.set_adjust_mode)
         self.camera_widget.calibration_completed.connect(self._on_calibration_completed)
+        self.camera_widget.corners_adjusted.connect(self._on_calibration_completed)
         self.auto_guess_btn.clicked.connect(self._on_auto_guess)
         self.lock_flow_chk.toggled.connect(
             lambda checked: self.worker.set_tracking_mode("optical_flow" if checked else "static")
         )
         self.snap_anchor_btn.clicked.connect(self.worker.reset_neck_to_anchor)
+        self.av_sync_spin.valueChanged.connect(lambda val: self.worker.set_av_sync_offset(float(val)))
         self.reset_key_btn.clicked.connect(self.worker.reset_key)
         self.scale_overlay_chk.toggled.connect(self.fretboard_widget.set_show_scale_overlay)
         self.demo_btn.toggled.connect(self.worker.set_demo_mode)
@@ -487,6 +503,7 @@ class MainWindow(QMainWindow):
         if e_fret <= s_fret:
             QMessageBox.information(self, "Invalid Fret Range", "End fret must be greater than start fret.")
             return
+        self.adjust_corners_btn.setChecked(False)
         self.camera_widget.start_calibration(s_fret, e_fret)
         self.statusBar().showMessage("Click 4 fretboard corners on the camera view (Right-click cancels).")
 

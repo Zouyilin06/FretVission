@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Literal
 
@@ -73,14 +73,23 @@ class CalibrationProfile:
 
     @classmethod
     def load(cls, name: str = "default", directory: Path | None = None) -> CalibrationProfile:
-        """Load a saved profile or return defaults if missing."""
+        """Load a saved profile or return defaults if missing or malformed."""
         target_dir = directory or default_profiles_dir()
         path = target_dir / f"{name}.json"
         if not path.exists():
             return cls(name=name)
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        guitar_raw = raw.pop("guitar", {})
-        return cls(guitar=GuitarConfig(**guitar_raw), **raw)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return cls(name=name)
+        guitar_raw = raw.pop("guitar", {}) if isinstance(raw, dict) else {}
+        valid_guitar_keys = {f.name for f in fields(GuitarConfig)}
+        valid_prof_keys = {f.name for f in fields(cls)} - {"guitar"}
+        guitar_cfg = GuitarConfig(
+            **{k: v for k, v in guitar_raw.items() if k in valid_guitar_keys}
+        )
+        prof_kwargs = {k: v for k, v in raw.items() if k in valid_prof_keys}
+        return cls(guitar=guitar_cfg, **prof_kwargs)
 
 
 @dataclass
@@ -91,5 +100,8 @@ class AppConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     profile: CalibrationProfile = field(default_factory=CalibrationProfile)
     key_half_life_s: float = 6.0
+    av_sync_offset_ms: float = 0.0
     tab_bpm: int = 100
     use_quantized_tab: bool = False
+    time_signature: str = "4/4"
+    tab_subdivision: int = 8

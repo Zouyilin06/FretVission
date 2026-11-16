@@ -32,6 +32,7 @@ class ActiveNote:
     finger_label: str | None = None
     cents_offset: float = 0.0
     bend_semitones: int = 0
+    technique: str | None = None  # "b", "h", "p", "/"
 
     @property
     def string_number(self) -> int:
@@ -101,6 +102,8 @@ class AudioVisualFusion:
         self.key_estimator = KeyEstimator(half_life_s=key_half_life_s)
 
         self._prev_sounding: dict[tuple[int, int], int] = {}  # (s, f) -> midi
+        self._prev_by_string: dict[int, tuple[int, str | None]] = {}  # string_idx -> (fret, finger_label)
+        self._pending_audio_only: dict[int, int] = {}  # midi -> consecutive frame count
         self._last_mono_anchor: tuple[int, int, int] | None = None  # (s, f, base_midi)
 
     def reset_key(self) -> None:
@@ -120,6 +123,8 @@ class AudioVisualFusion:
         self.max_fret = int(max_fret)
         self.custom_tuning = custom_tuning
         self._prev_sounding.clear()
+        self._prev_by_string.clear()
+        self._pending_audio_only.clear()
         self._last_mono_anchor = None
 
     def fuse(
@@ -151,7 +156,7 @@ class AudioVisualFusion:
                     finger_map[key] = obs
                 if obs.fret_idx > self.capo:
                     hand_frets.append(obs.fret_idx)
-                midi = base_midis[obs.string_idx] + (obs.fret_idx - self.capo)
+                midi = base_midis[obs.string_idx] + obs.fret_idx
                 hover_notes.append(
                     ActiveNote(
                         string_idx=obs.string_idx,
@@ -168,16 +173,37 @@ class AudioVisualFusion:
         sounding_notes: list[ActiveNote] = []
 
         if not audio_result.is_silent and audio_result.pitches:
-            sounding_notes = self._assign_pitches(
+            raw_notes = self._assign_pitches(
                 audio_result.pitches,
                 base_midis,
                 hand_result if has_visual else None,
                 finger_map,
                 hand_center_fret,
             )
+            # Temporal glitch filter for uncorroborated non-onset audio_only spikes
+            prev_midis = set(self._prev_sounding.values())
+            new_pending: dict[int, int] = {}
+            for note in raw_notes:
+                if (
+                    note.source == "av_fused"
+                    or audio_result.is_onset
+                    or note.midi in prev_midis
+                    or note.confidence >= 0.85
+                ):
+                    sounding_notes.append(note)
+                else:
+                    cnt = self._pending_audio_only.get(note.midi, 0) + 1
+                    new_pending[note.midi] = cnt
+                    if cnt >= 2:
+                        sounding_notes.append(note)
+            self._pending_audio_only = new_pending
+            sounding_notes = self._annotate_techniques(sounding_notes, audio_result.is_onset)
+        else:
+            self._pending_audio_only.clear()
 
         # Update temporal continuity & bend anchor
         self._prev_sounding = {(n.string_idx, n.fret): n.midi for n in sounding_notes}
+        self._prev_by_string = {n.string_idx: (n.fret, n.finger_label) for n in sounding_notes}
         if len(sounding_notes) == 1 and sounding_notes[0].bend_semitones == 0:
             n0 = sounding_notes[0]
             self._last_mono_anchor = (n0.string_idx, n0.fret, n0.midi)
@@ -239,6 +265,7 @@ class AudioVisualFusion:
                             finger_label=f_obs.finger_label if f_obs else None,
                             cents_offset=p0.cents_offset,
                             bend_semitones=delta_semi,
+                            technique="b",
                         )
                     ]
 
@@ -350,6 +377,11 @@ class AudioVisualFusion:
                     source = "av_fused"
                 else:
                     score -= 0.20
+                # Same-string physics: a higher pressed fret blocks any lower fret from sounding
+                if f_idx + 1 < mat.shape[1]:
+                    hi_block = float(np.max(mat[pos.string_idx, f_idx + 1 :]))
+                    if hi_block >= 0.55:
+                        score -= 0.75
 
         # Ergonomic hand-span preference
         if hand_center_fret is not None and pos.fret > self.capo:
@@ -365,3 +397,54 @@ class AudioVisualFusion:
             score += 0.35
 
         return score, source
+
+    def _annotate_techniques(
+        self,
+        notes: list[ActiveNote],
+        is_onset: bool,
+    ) -> list[ActiveNote]:
+        """Tag legato transitions (hammer-on, pull-off, slide) on the same string."""
+        if not self._prev_by_string or is_onset:
+            return notes
+        annotated: list[ActiveNote] = []
+        for n in notes:
+            if n.technique is not None:
+                annotated.append(n)
+                continue
+            prev = self._prev_by_string.get(n.string_idx)
+            if prev is None:
+                annotated.append(n)
+                continue
+            prev_fret, prev_finger = prev
+            delta = n.fret - prev_fret
+            tech: str | None = None
+            if delta != 0:
+                same_finger = (
+                    n.finger_label is not None
+                    and prev_finger is not None
+                    and n.finger_label == prev_finger
+                )
+                if same_finger or abs(delta) >= 4:
+                    tech = "/"
+                elif delta > 0:
+                    tech = "h"
+                elif delta < 0:
+                    tech = "p"
+            if tech is not None:
+                annotated.append(
+                    ActiveNote(
+                        string_idx=n.string_idx,
+                        fret=n.fret,
+                        midi=n.midi,
+                        note_name=n.note_name,
+                        confidence=n.confidence,
+                        source=n.source,
+                        finger_label=n.finger_label,
+                        cents_offset=n.cents_offset,
+                        bend_semitones=n.bend_semitones,
+                        technique=tech,
+                    )
+                )
+            else:
+                annotated.append(n)
+        return annotated

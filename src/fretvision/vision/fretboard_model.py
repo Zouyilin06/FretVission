@@ -68,6 +68,7 @@ class FretboardModel:
         corners = np.asarray(corners_px, dtype=np.float32).reshape(4, 2)
         if end_fret <= start_fret:
             raise ValueError(f"end_fret ({end_fret}) must be > start_fret ({start_fret})")
+        self._validate_corners(corners)
 
         self.start_fret = int(start_fret)
         self.end_fret = int(end_fret)
@@ -88,7 +89,19 @@ class FretboardModel:
 
         # H maps canonical (u, v) -> image (x, y)
         self.H: np.ndarray = cv2.getPerspectiveTransform(canonical_quad, corners)
+        if not np.all(np.isfinite(self.H)) or abs(float(np.linalg.det(self.H))) < 1e-8:
+            raise ValueError("Calibration corners produced a singular perspective homography.")
         self.H_inv: np.ndarray = np.linalg.inv(self.H)
+
+    @staticmethod
+    def _validate_corners(corners: np.ndarray) -> None:
+        """Ensure 4 calibration corners form a non-degenerate convex quad."""
+        if not np.all(np.isfinite(corners)):
+            raise ValueError("Calibration corners contain non-finite coordinates.")
+        if float(cv2.contourArea(corners)) < 100.0:
+            raise ValueError("Calibration region is too small or collinear.")
+        if not cv2.isContourConvex(corners):
+            raise ValueError("Calibration corners must form a convex quadrilateral without crossed edges.")
 
     @classmethod
     def from_homography(
@@ -100,12 +113,15 @@ class FretboardModel:
         edge_margin: float = 0.085,
     ) -> FretboardModel:
         """Construct a FretboardModel directly from an updated homography matrix H."""
+        H_arr = np.asarray(H, dtype=np.float64).copy()
+        if H_arr.shape != (3, 3) or not np.all(np.isfinite(H_arr)) or abs(float(np.linalg.det(H_arr))) < 1e-8:
+            raise ValueError("Homography matrix must be finite and invertible (3x3).")
         obj = cls.__new__(cls)
         obj.start_fret = int(start_fret)
         obj.end_fret = int(end_fret)
         obj.max_fret = int(max_fret)
         obj.edge_margin = float(edge_margin)
-        obj.H = np.asarray(H, dtype=np.float64).copy()
+        obj.H = H_arr
         obj.H_inv = np.linalg.inv(obj.H)
         return obj
 

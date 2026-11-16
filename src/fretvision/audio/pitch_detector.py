@@ -258,12 +258,14 @@ class HybridHarmonicPitchDetector(PitchDetector):
             )
 
         spec = self._compute_multires_spectrum(x, sample_rate)
-        # Positive spectral flux + amplitude rise detects string plucks cleanly
+        # Positive spectral flux detects both loud attacks and quiet high-string plucks over ringing bass
         is_onset = False
         if self._prev_spec is not None:
             flux = float(np.sum(np.maximum(0.0, spec - self._prev_spec)))
             norm_flux = flux / (float(np.sum(self._prev_spec)) + 1e-6)
-            if norm_flux > self.onset_flux_threshold and rms > self._prev_rms * 1.12:
+            if (norm_flux > self.onset_flux_threshold and rms > self._prev_rms * 1.03) or (
+                norm_flux > self.onset_flux_threshold * 1.45
+            ):
                 is_onset = True
         else:
             is_onset = True
@@ -274,6 +276,20 @@ class HybridHarmonicPitchDetector(PitchDetector):
         # Solve Harmonic NNLS: spec ~= W @ weights
         dictionary = self._get_dictionary(sample_rate)
         weights, _ = nnls(dictionary, spec)
+
+        # Reject broadband percussive muted strums / pick scrapes via spectral flatness
+        spec_pos = spec + 1e-12
+        flatness = math.exp(float(np.mean(np.log(spec_pos)))) / (float(np.mean(spec_pos)) + 1e-12)
+        total_w = float(np.sum(weights)) + 1e-12
+        raw_max_w = float(np.max(weights)) if len(weights) else 0.0
+        if flatness > 0.50 and (raw_max_w / total_w) < 0.16:
+            return AudioAnalysisResult(
+                pitches=(),
+                rms_db=rms_db,
+                is_onset=False,
+                is_silent=True,
+                dominant_cents=0.0,
+            )
 
         # Apply subtle visual prior boost when fingers isolate specific notes
         if visual_pitch_priors:
@@ -367,9 +383,12 @@ class HybridHarmonicPitchDetector(PitchDetector):
             if len(filtered) >= 6:
                 break
 
-        # Monophonic fast path via YIN for razor-sharp cents & smooth bend tracking
+        # Monophonic fast path via YIN (never collapse genuine 2-note power chords / double-stops)
+        is_effectively_mono = len(filtered) <= 1 or (
+            len(filtered) == 2 and filtered[1][1] < filtered[0][1] * 0.35
+        )
         yin_freq, yin_conf = yin_pitch(x[-3072:] if len(x) >= 3072 else x, sample_rate)
-        if yin_freq is not None and yin_conf >= 0.78 and len(filtered) <= 2:
+        if yin_freq is not None and yin_conf >= 0.78 and is_effectively_mono:
             y_midi, y_cents = freq_to_midi_and_cents(yin_freq)
             if self.midi_min <= y_midi <= self.midi_max:
                 # Confirm YIN agrees with strongest NNLS note (or is within a bend of +-2 semitones)

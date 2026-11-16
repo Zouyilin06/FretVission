@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -47,6 +47,30 @@ class EngineSnapshot:
     audio_latency_ms: float
     tuning_name: str
     demo_mode: bool
+
+
+class HandHistoryBuffer:
+    """Timestamped ring buffer of recent hand-tracking observations for AV sync."""
+
+    def __init__(self, max_age_s: float = 0.5) -> None:
+        self.max_age_s = float(max_age_s)
+        self._items: deque[tuple[float, HandTrackingResult | None]] = deque(maxlen=60)
+
+    def push(self, timestamp_s: float, result: HandTrackingResult | None) -> None:
+        self._items.append((float(timestamp_s), result))
+        cutoff = timestamp_s - self.max_age_s
+        while len(self._items) > 1 and self._items[0][0] < cutoff:
+            self._items.popleft()
+
+    def nearest(self, target_ts: float) -> HandTrackingResult | None:
+        if not self._items:
+            return None
+        best_ts, best_res = min(self._items, key=lambda pair: abs(pair[0] - target_ts))
+        _ = best_ts
+        return best_res
+
+    def clear(self) -> None:
+        self._items.clear()
 
 
 class ModelDownloadWorker(QThread):
@@ -104,15 +128,20 @@ class ProcessingWorker(QThread):
         self.tab_recorder = TabRecorder()
 
         if config.profile.corners_px is not None:
-            self.neck_tracker.set_calibration(
-                np.asarray(config.profile.corners_px, dtype=np.float32),
-                start_fret=config.profile.start_fret,
-                end_fret=config.profile.end_fret,
-                max_fret=config.profile.guitar.max_fret,
-            )
+            try:
+                self.neck_tracker.set_calibration(
+                    np.asarray(config.profile.corners_px, dtype=np.float32),
+                    start_fret=config.profile.start_fret,
+                    end_fret=config.profile.end_fret,
+                    max_fret=config.profile.guitar.max_fret,
+                )
+            except ValueError:
+                config.profile.corners_px = None
 
         self._demo_mode = False
         self._demo_start_s = 0.0
+        self._av_sync_offset_ms = float(config.av_sync_offset_ms)
+        self._hand_history = HandHistoryBuffer(max_age_s=0.5)
         self._last_frame_ts = 0.0
         self._last_hand_result: HandTrackingResult | None = None
         self._last_frame_bgr: np.ndarray | None = None
@@ -190,17 +219,26 @@ class ProcessingWorker(QThread):
 
     def set_calibration(self, corners_px: np.ndarray, start_fret: int, end_fret: int) -> None:
         with self._lock:
+            try:
+                self.neck_tracker.set_calibration(
+                    corners_px,
+                    start_fret=start_fret,
+                    end_fret=end_fret,
+                    max_fret=self.config.profile.guitar.max_fret,
+                )
+            except ValueError as exc:
+                self.status_message.emit(f"Invalid calibration: {exc}")
+                return
             self.config.profile.corners_px = corners_px.tolist()
             self.config.profile.start_fret = int(start_fret)
             self.config.profile.end_fret = int(end_fret)
-            self.neck_tracker.set_calibration(
-                corners_px,
-                start_fret=start_fret,
-                end_fret=end_fret,
-                max_fret=self.config.profile.guitar.max_fret,
-            )
             self.config.profile.save()
             self.status_message.emit(f"Fretboard calibrated (frets {start_fret}–{end_fret})")
+
+    def set_av_sync_offset(self, offset_ms: float) -> None:
+        with self._lock:
+            self._av_sync_offset_ms = float(max(-300.0, min(300.0, offset_ms)))
+            self.config.av_sync_offset_ms = self._av_sync_offset_ms
 
     def auto_guess_calibration(self, start_fret: int, end_fret: int) -> bool:
         with self._lock:
@@ -320,17 +358,25 @@ class ProcessingWorker(QThread):
                 )
                 neck_res = self.neck_tracker.update(frame_bgr, hand_masks=hand_res.hand_bboxes)
                 if neck_res.model is not None and hand_res.hand_present:
-                    # Re-project landmarks with updated neck homography
-                    hand_res = self._remap_fingers(hand_res, neck_res.model)
+                    hand_res = self.hand_tracker.project_to_fretboard(hand_res, neck_res.model)
 
                 self._last_hand_result = hand_res
+                self._hand_history.push(frame_ts, hand_res)
                 self._last_neck_status = neck_res.status
                 self._last_tracked_pts = neck_res.tracked_point_count
 
             t_aud0 = time.perf_counter()
-            audio_buf = self.audio_source.read_window(4096)
+            audio_delay_ms = max(0.0, self._av_sync_offset_ms)
+            audio_buf = self.audio_source.read_window(4096, delay_ms=audio_delay_ms)
+            if self._av_sync_offset_ms < 0.0:
+                sync_hand = self._hand_history.nearest(now_s + (self._av_sync_offset_ms / 1000.0))
+                if sync_hand is None:
+                    sync_hand = self._last_hand_result
+            else:
+                sync_hand = self._last_hand_result
+
             priors = build_visual_pitch_priors(
-                self._last_hand_result,
+                sync_hand,
                 self.config.profile.guitar.tuning_name,
                 capo=self.config.profile.guitar.capo,
                 max_fret=self.config.profile.guitar.max_fret,
@@ -345,7 +391,7 @@ class ProcessingWorker(QThread):
             fused = self.fusion.fuse(
                 timestamp_s=now_s,
                 audio_result=audio_res,
-                hand_result=self._last_hand_result,
+                hand_result=sync_hand,
                 fretboard_calibrated=self.neck_tracker.is_calibrated,
             )
             self.tab_recorder.ingest(fused)
@@ -367,44 +413,6 @@ class ProcessingWorker(QThread):
                 tuning_name=self.config.profile.guitar.tuning_name,
                 demo_mode=False,
             )
-
-    @staticmethod
-    def _remap_fingers(hand_res: HandTrackingResult, fretboard: FretboardModel) -> HandTrackingResult:
-        """Refresh FingerObservation mappings using the latest tracked FretboardModel."""
-        matrix = np.zeros_like(hand_res.press_prob_matrix)
-        updated: list[FingerObservation] = []
-        for f in hand_res.fingers:
-            mapped = fretboard.map_image_point(*f.pixel_xy)
-            in_bounds = mapped.in_bounds and not (f.finger_label == "T" and mapped.continuous_string > 1.2)
-            updated.append(
-                FingerObservation(
-                    finger_label=f.finger_label,
-                    pixel_xy=f.pixel_xy,
-                    string_float=mapped.continuous_string,
-                    fret_float=mapped.continuous_fret,
-                    string_idx=mapped.string_idx if in_bounds else None,
-                    fret_idx=mapped.fret_idx if in_bounds else None,
-                    in_bounds=in_bounds,
-                    confidence=f.confidence,
-                )
-            )
-            if in_bounds and mapped.fret_idx is not None and mapped.fret_idx >= 1 and mapped.string_idx is not None:
-                s_c = mapped.string_idx
-                f_c = mapped.fret_idx
-                for ds in (-1, 0, 1):
-                    s = s_c + ds
-                    if not (0 <= s < 6):
-                        continue
-                    for df in (-1, 0, 1):
-                        fr = f_c + df
-                        if not (1 <= fr < matrix.shape[1]):
-                            continue
-                        d2 = ((s - mapped.continuous_string) / 0.65) ** 2 + ((fr - f_c) / 0.55) ** 2
-                        matrix[s, fr] = max(float(matrix[s, fr]), math.exp(-0.5 * d2))
-
-        hand_res.fingers = updated
-        hand_res.press_prob_matrix = matrix
-        return hand_res
 
     def _step_demo(self, now_s: float) -> EngineSnapshot:
         """Synthesize realistic guitar chords & melody audio + animated neck visuals."""
