@@ -195,6 +195,10 @@ class MainWindow(QMainWindow):
         self.snap_anchor_btn = QPushButton("Re-Snap Neck")
         row2.addWidget(self.snap_anchor_btn)
 
+        self.save_sample_btn = QPushButton("Save Sample")
+        self.save_sample_btn.setToolTip("Save current calibrated frame & 4 corners for YOLO-Pose GPU training")
+        row2.addWidget(self.save_sample_btn)
+
         row2.addWidget(QLabel("AV Sync:"))
         self.av_sync_spin = QSpinBox()
         self.av_sync_spin.setRange(-300, 300)
@@ -402,6 +406,7 @@ class MainWindow(QMainWindow):
             lambda checked: self.worker.set_tracking_mode("optical_flow" if checked else "static")
         )
         self.snap_anchor_btn.clicked.connect(self.worker.reset_neck_to_anchor)
+        self.save_sample_btn.clicked.connect(self._on_save_sample)
         self.av_sync_spin.valueChanged.connect(lambda val: self.worker.set_av_sync_offset(float(val)))
         self.reset_key_btn.clicked.connect(self.worker.reset_key)
         self.scale_overlay_chk.toggled.connect(self.fretboard_widget.set_show_scale_overlay)
@@ -522,8 +527,13 @@ class MainWindow(QMainWindow):
         ok = self.worker.auto_guess_calibration(s_fret, e_fret)
         if not ok:
             self.statusBar().showMessage(
-                "Auto-Guess couldn't isolate parallel neck edges cleanly — use 4-Click Calibrate."
+                "Auto-Guess couldn't isolate fretboard — use 4-Click Calibrate."
             )
+
+    def _on_save_sample(self) -> None:
+        out = self.worker.save_training_sample()
+        if out is None:
+            self.statusBar().showMessage("Calibrate on a live/loaded frame before saving a training sample.")
 
     def _on_gate_changed(self, value: int) -> None:
         self.gate_val_lbl.setText(f"{value} dB")

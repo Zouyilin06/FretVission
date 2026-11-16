@@ -21,6 +21,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+gpu = [
+    "onnxruntime-directml>=1.19",
+]
 
 [project.scripts]
 fretvision = "fretvision.app:main"

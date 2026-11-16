@@ -29,6 +29,7 @@ from fretvision.vision.neck_tracker import (
     NeckTrackingStatus,
     auto_guess_neck_corners,
 )
+from fretvision.vision.neural_neck import NeuralNeckDetector, export_yolo_pose_sample
 from fretvision.vision.video_source import VideoSource
 
 
@@ -114,6 +115,7 @@ class ProcessingWorker(QThread):
             hop_size=config.audio.hop_size,
         )
         self.neck_tracker = NeckTracker(tracking_mode=config.profile.tracking_mode)
+        self.neural_neck = NeuralNeckDetector()
         self.hand_tracker = HandTracker(max_fret=config.profile.guitar.max_fret)
         self.pitch_detector = HybridHarmonicPitchDetector(
             noise_gate_db=config.audio.noise_gate_db,
@@ -245,11 +247,30 @@ class ProcessingWorker(QThread):
             frame = self._last_frame_bgr
             if frame is None:
                 return False
-            corners = auto_guess_neck_corners(frame)
+            corners = auto_guess_neck_corners(frame, neural_detector=self.neural_neck)
             if corners is None:
                 return False
             self.set_calibration(corners, start_fret, end_fret)
+            self.status_message.emit(
+                f"Auto-Guess locked via {self.neural_neck.provider_name}"
+            )
             return True
+
+    def save_training_sample(self) -> str | None:
+        """Save current calibrated camera frame + 4 corners as a YOLO-Pose sample."""
+        with self._lock:
+            frame = self._last_frame_bgr
+            model = self.neck_tracker.model
+            if frame is None or model is None:
+                return None
+            out = export_yolo_pose_sample(
+                frame,
+                model.get_calibrated_corners_px(),
+                model.start_fret,
+                model.end_fret,
+            )
+            self.status_message.emit(f"Saved YOLO-Pose sample: {out.name}")
+            return str(out)
 
     def set_tracking_mode(self, mode: str) -> None:
         with self._lock:
