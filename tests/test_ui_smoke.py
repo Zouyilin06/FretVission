@@ -66,11 +66,18 @@ def test_main_window_headless_snapshot_render() -> None:
         neck_status=NeckTrackingStatus.LOCKED,
         tracked_points=32,
         fused=fused,
-        tab_columns=[TabColumn(timestamp_s=1.0, frets={0: 3, 4: 0, 5: 3}, chord_label="G")],
+        tab_columns=[
+            TabColumn(timestamp_s=1.0, frets={0: 3, 4: 0, 5: 3}, chord_label="G", bar_idx=0, grid_slot=0),
+            TabColumn(timestamp_s=2.0, frets={5: 5}, techniques={5: "h"}, bar_idx=1, grid_slot=0),
+        ],
         video_fps=30.0,
         audio_latency_ms=2.1,
         tuning_name="Standard (EADGBE)",
         demo_mode=False,
+        clip_active=True,
+        clip_position_s=12.0,
+        clip_duration_s=45.0,
+        clip_playing=True,
     )
 
     win._on_snapshot(snap)
@@ -78,6 +85,13 @@ def test_main_window_headless_snapshot_render() -> None:
     assert win.chord_badge_lbl.text() == "G"
     assert "G2" in win.note_hero_lbl.text()
     assert win.key_conf_bar.value() == 88
+    assert not win.clip_bar.isHidden()
+    assert win.clip_time_lbl.text() == "00:12 / 00:45"
+
+    win.tab_widget.quantize_chk.setChecked(True)
+    win.tab_widget.bpm_spin.setValue(120)
+    assert win.worker.tab_recorder.mode == "quantized"
+    assert win.worker.tab_recorder.bpm == 120
 
     # Render widgets offscreen to verify QPainter code paths don't raise
     win.resize(1280, 800)

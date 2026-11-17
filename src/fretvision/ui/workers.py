@@ -12,6 +12,7 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 from fretvision.audio.audio_source import AudioSource
+from fretvision.audio.metronome import MetronomeEngine
 from fretvision.audio.pitch_detector import HybridHarmonicPitchDetector
 from fretvision.config import AppConfig
 from fretvision.fusion.av_fusion import (
@@ -19,6 +20,7 @@ from fretvision.fusion.av_fusion import (
     FusedFrameResult,
     build_visual_pitch_priors,
 )
+from fretvision.fusion.clip_replay import ClipReplaySource
 from fretvision.fusion.tab_recorder import TabColumn, TabRecorder
 from fretvision.theory.music import midi_to_freq
 from fretvision.vision.fretboard_model import FretboardModel
@@ -48,6 +50,10 @@ class EngineSnapshot:
     audio_latency_ms: float
     tuning_name: str
     demo_mode: bool
+    clip_active: bool = False
+    clip_position_s: float = 0.0
+    clip_duration_s: float = 0.0
+    clip_playing: bool = False
 
 
 class HandHistoryBuffer:
@@ -127,7 +133,18 @@ class ProcessingWorker(QThread):
             max_fret=config.profile.guitar.max_fret,
             key_half_life_s=config.key_half_life_s,
         )
-        self.tab_recorder = TabRecorder()
+        self.tab_recorder = TabRecorder(
+            mode="quantized" if config.use_quantized_tab else "free_time",
+            bpm=config.tab_bpm,
+            time_signature=config.time_signature,
+            subdivision=config.tab_subdivision,
+        )
+        self.metronome = MetronomeEngine(
+            bpm=config.tab_bpm,
+            time_signature=config.time_signature,
+        )
+        self._clip_source: ClipReplaySource | None = None
+        self._last_clip_tick_s: float = 0.0
 
         if config.profile.corners_px is not None:
             try:
@@ -141,7 +158,7 @@ class ProcessingWorker(QThread):
                 config.profile.corners_px = None
 
         self._demo_mode = False
-        self._demo_start_s = 0.0
+        self._demo_start_s: float | None = None
         self._av_sync_offset_ms = float(config.av_sync_offset_ms)
         self._hand_history = HandHistoryBuffer(max_age_s=0.5)
         self._last_frame_ts = 0.0
@@ -154,8 +171,11 @@ class ProcessingWorker(QThread):
 
     def set_demo_mode(self, enabled: bool) -> None:
         with self._lock:
+            if enabled and self._clip_source is not None:
+                self._clip_source.close()
+                self._clip_source = None
             self._demo_mode = bool(enabled)
-            self._demo_start_s = time.monotonic()
+            self._demo_start_s = None
             self.fusion.reset_key()
             self.tab_recorder.clear()
             if enabled:
@@ -319,6 +339,87 @@ class ProcessingWorker(QThread):
         with self._lock:
             return str(self.tab_recorder.export_json(path, tuning_name=tuning_name))
 
+    def export_midi_tab(self, path: str, tuning_name: str, bpm: int) -> str:
+        with self._lock:
+            return str(self.tab_recorder.export_midi(path, tuning_name=tuning_name, bpm=bpm))
+
+    def export_musicxml_tab(
+        self, path: str, tuning_name: str, bpm: int, time_signature: str
+    ) -> str:
+        with self._lock:
+            return str(
+                self.tab_recorder.export_musicxml(
+                    path, tuning_name=tuning_name, bpm=bpm, time_signature=time_signature
+                )
+            )
+
+    def set_tab_timing(self, quantized: bool, bpm: int, time_signature: str) -> None:
+        with self._lock:
+            self.config.use_quantized_tab = bool(quantized)
+            self.config.tab_bpm = int(bpm)
+            self.config.time_signature = time_signature
+            self.tab_recorder.set_timing(
+                "quantized" if quantized else "free_time",
+                bpm=bpm,
+                time_signature=time_signature,
+            )
+            self.metronome.set_tempo(bpm, time_signature)
+
+    def set_metronome(self, enabled: bool, bpm: int, time_signature: str) -> None:
+        with self._lock:
+            self.metronome.set_tempo(bpm, time_signature)
+            if enabled:
+                if not self.metronome.start():
+                    self.error_occurred.emit(
+                        f"Metronome audio error: {self.metronome.last_error or 'No output device'}"
+                    )
+                else:
+                    self.tab_recorder.reset_quantize_clock()
+            else:
+                self.metronome.stop()
+
+    def load_clip(self, video_path: str, audio_path: str | None = None) -> bool:
+        with self._lock:
+            self._demo_mode = False
+            if self._clip_source is not None:
+                self._clip_source.close()
+                self._clip_source = None
+            clip = ClipReplaySource(
+                video_path,
+                audio_path=audio_path,
+                mirror=self.config.camera.mirror,
+                rotation_deg=self.config.camera.rotation_deg,
+            )
+            if not clip.open():
+                self.error_occurred.emit(clip.last_error or "Failed to load clip")
+                return False
+            self._clip_source = clip
+            self._last_clip_tick_s = time.monotonic()
+            self.fusion.reset_key()
+            self.tab_recorder.clear()
+            self._hand_history.clear()
+            self.status_message.emit(f"Clip loaded: {video_path}")
+            return True
+
+    def set_clip_playing(self, playing: bool) -> None:
+        with self._lock:
+            if self._clip_source is not None:
+                self._clip_source.playing = bool(playing)
+                self._last_clip_tick_s = time.monotonic()
+
+    def seek_clip(self, time_s: float) -> None:
+        with self._lock:
+            if self._clip_source is not None:
+                self._clip_source.seek(time_s)
+                self._last_clip_tick_s = time.monotonic()
+
+    def close_clip(self) -> None:
+        with self._lock:
+            if self._clip_source is not None:
+                self._clip_source.close()
+                self._clip_source = None
+                self.status_message.emit("Exited Clip Replay — returned to live feeds.")
+
     def reload_hand_model(self) -> None:
         with self._lock:
             self.hand_tracker.close()
@@ -351,6 +452,9 @@ class ProcessingWorker(QThread):
                 sleep_s = max(0.004, 0.028 - elapsed)
                 time.sleep(sleep_s)
         finally:
+            self.metronome.stop()
+            if self._clip_source is not None:
+                self._clip_source.close()
             self.video_source.close()
             self.audio_source.close()
             self.hand_tracker.close()
@@ -359,6 +463,8 @@ class ProcessingWorker(QThread):
         with self._lock:
             if self._demo_mode:
                 return self._step_demo(now_s)
+            if self._clip_source is not None:
+                return self._step_clip(now_s)
 
             frame_bgr, frame_ts = self.video_source.read_latest()
             if frame_bgr is not None and frame_ts > self._last_frame_ts:
@@ -418,7 +524,7 @@ class ProcessingWorker(QThread):
             self.tab_recorder.ingest(fused)
 
             tab_snapshot = [
-                TabColumn(c.timestamp_s, dict(c.frets), c.chord_label)
+                TabColumn(c.timestamp_s, dict(c.frets), c.chord_label, dict(c.techniques), c.bar_idx, c.grid_slot)
                 for c in self.tab_recorder.columns
             ]
             return EngineSnapshot(
@@ -437,6 +543,8 @@ class ProcessingWorker(QThread):
 
     def _step_demo(self, now_s: float) -> EngineSnapshot:
         """Synthesize realistic guitar chords & melody audio + animated neck visuals."""
+        if self._demo_start_s is None:
+            self._demo_start_s = now_s
         t = now_s - self._demo_start_s
         # Cycle: G major chord -> Em chord -> C major chord -> D major chord -> G-A-B-D lead riff
         events: list[tuple[str, tuple[int, ...], tuple[tuple[int, int, str], ...]]] = [
@@ -522,7 +630,7 @@ class ProcessingWorker(QThread):
         self.tab_recorder.ingest(fused)
 
         tab_snapshot = [
-            TabColumn(c.timestamp_s, dict(c.frets), c.chord_label)
+            TabColumn(c.timestamp_s, dict(c.frets), c.chord_label, dict(c.techniques), c.bar_idx, c.grid_slot)
             for c in self.tab_recorder.columns
         ]
         return EngineSnapshot(
@@ -537,4 +645,65 @@ class ProcessingWorker(QThread):
             audio_latency_ms=1.8,
             tuning_name="Standard (EADGBE)",
             demo_mode=True,
+        )
+
+    def _step_clip(self, now_s: float) -> EngineSnapshot:
+        """Process a synchronized frame and audio window from an offline recorded clip."""
+        clip = self._clip_source
+        assert clip is not None
+        dt = max(0.0, min(0.1, now_s - self._last_clip_tick_s))
+        self._last_clip_tick_s = now_s
+        clip.mirror = self.config.camera.mirror
+        clip.rotation_deg = self.config.camera.rotation_deg
+        clip.advance(dt, loop=True)
+
+        frame_bgr, audio_buf, sr, pos_s = clip.read_at_current_position(4096)
+        if frame_bgr is not None:
+            self._last_frame_bgr = frame_bgr
+            ts_ms = int(now_s * 1000)
+            hand_res = self.hand_tracker.process_frame(frame_bgr, ts_ms, self.neck_tracker.model)
+            neck_res = self.neck_tracker.update(frame_bgr, hand_masks=hand_res.hand_bboxes)
+            if neck_res.model is not None and hand_res.hand_present:
+                hand_res = self.hand_tracker.project_to_fretboard(hand_res, neck_res.model)
+            self._last_hand_result = hand_res
+            self._last_neck_status = neck_res.status
+            self._last_tracked_pts = neck_res.tracked_point_count
+
+        t_aud0 = time.perf_counter()
+        priors = build_visual_pitch_priors(
+            self._last_hand_result,
+            self.config.profile.guitar.tuning_name,
+            capo=self.config.profile.guitar.capo,
+            max_fret=self.config.profile.guitar.max_fret,
+        )
+        audio_res = self.pitch_detector.analyze(audio_buf, sr, visual_pitch_priors=priors)
+        audio_ms = (time.perf_counter() - t_aud0) * 1000.0
+
+        fused = self.fusion.fuse(
+            timestamp_s=pos_s,
+            audio_result=audio_res,
+            hand_result=self._last_hand_result,
+            fretboard_calibrated=self.neck_tracker.is_calibrated,
+        )
+        self.tab_recorder.ingest(fused)
+        tab_snapshot = [
+            TabColumn(c.timestamp_s, dict(c.frets), c.chord_label, dict(c.techniques), c.bar_idx, c.grid_slot)
+            for c in self.tab_recorder.columns
+        ]
+        return EngineSnapshot(
+            frame_bgr=self._last_frame_bgr,
+            fretboard=self.neck_tracker.model,
+            hand_result=self._last_hand_result,
+            neck_status=self._last_neck_status,
+            tracked_points=self._last_tracked_pts,
+            fused=fused,
+            tab_columns=tab_snapshot,
+            video_fps=clip.fps,
+            audio_latency_ms=audio_ms,
+            tuning_name=self.config.profile.guitar.tuning_name,
+            demo_mode=False,
+            clip_active=True,
+            clip_position_s=pos_s,
+            clip_duration_s=clip.duration_s,
+            clip_playing=clip.playing,
         )

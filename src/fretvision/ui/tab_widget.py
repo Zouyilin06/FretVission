@@ -1,18 +1,22 @@
-"""Live scrolling 6-string guitar tablature staff widget."""
+"""Live scrolling 6-string guitar tablature staff widget with metronome/quantize/export controls."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from fretvision.audio.metronome import TIME_SIGNATURES
 from fretvision.fusion.tab_recorder import TabColumn
 from fretvision.theory.music import base_open_midis, pc_to_name
 
@@ -73,37 +77,54 @@ class _TabCanvas(QWidget):
             )
             return
 
-        col_spacing = 36.0
+        col_spacing = 38.0
         max_visible = max(1, int((w - left_pad - right_pad - 20.0) / col_spacing))
         visible = self._columns[-max_visible:]
 
+        prev_bar = visible[0].bar_idx
         for idx, col in enumerate(visible):
-            cx = left_pad + 22.0 + idx * col_spacing
+            cx = left_pad + 24.0 + idx * col_spacing
 
-            # Bar separator every 4 events for visual readability
-            if idx > 0 and idx % 4 == 0:
-                painter.setPen(QPen(QColor("#262D3A"), 1.0, Qt.PenStyle.DashLine))
-                painter.drawLine(QPointF(cx - col_spacing * 0.5, top_y), QPointF(cx - col_spacing * 0.5, top_y + staff_h))
+            # Draw measure barlines on bar transitions in quantized mode, else every 4 events
+            draw_bar = False
+            solid_bar = False
+            if col.bar_idx is not None and prev_bar is not None and col.bar_idx != prev_bar:
+                draw_bar = True
+                solid_bar = True
+            elif col.bar_idx is None and idx > 0 and idx % 4 == 0:
+                draw_bar = True
+            prev_bar = col.bar_idx
+
+            if draw_bar:
+                pen_style = Qt.PenStyle.SolidLine if solid_bar else Qt.PenStyle.DashLine
+                pen_col = QColor("#4B5563") if solid_bar else QColor("#262D3A")
+                painter.setPen(QPen(pen_col, 1.4 if solid_bar else 1.0, pen_style))
+                painter.drawLine(
+                    QPointF(cx - col_spacing * 0.5, top_y),
+                    QPointF(cx - col_spacing * 0.5, top_y + staff_h),
+                )
 
             if col.chord_label:
                 painter.setPen(QColor("#F59E0B"))
                 painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-                painter.drawText(QRectF(cx - 22, 4, 44, 18), Qt.AlignmentFlag.AlignCenter, col.chord_label)
+                painter.drawText(QRectF(cx - 24, 4, 48, 18), Qt.AlignmentFlag.AlignCenter, col.chord_label)
 
             is_latest = idx == len(visible) - 1
             painter.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
-            for s_idx, fret in col.frets.items():
+            for s_idx in col.frets:
+                token = col.format_token(s_idx)
                 sy = string_ys[s_idx]
-                pill = QRectF(cx - 11, sy - 9, 22, 18)
+                pill_w = max(22.0, 9.0 * len(token) + 8.0)
+                pill = QRectF(cx - pill_w * 0.5, sy - 9, pill_w, 18)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor("#1D4ED8") if is_latest else QColor("#11161D"))
                 painter.drawRoundedRect(pill, 4.0, 4.0)
                 painter.setPen(QColor("#FFFFFF") if is_latest else QColor("#E2E8F0"))
-                painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, str(fret))
+                painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, token)
 
 
 class LiveTabWidget(QWidget):
-    """Rolling tablature display with Pause, Clear, and Export actions."""
+    """Rolling tablature display with Metronome, Quantize, Pause/Clear, and Export controls."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -112,20 +133,44 @@ class LiveTabWidget(QWidget):
         root.setSpacing(6)
 
         header = QHBoxLayout()
+        header.setSpacing(6)
         title = QLabel("LIVE GUITAR TABLATURE")
         title.setObjectName("CardTitle")
         header.addWidget(title)
+
+        header.addSpacing(8)
+        header.addWidget(QLabel("BPM:"))
+        self.bpm_spin = QSpinBox()
+        self.bpm_spin.setRange(40, 220)
+        self.bpm_spin.setValue(100)
+        header.addWidget(self.bpm_spin)
+
+        self.timesig_combo = QComboBox()
+        self.timesig_combo.addItems(list(TIME_SIGNATURES.keys()))
+        header.addWidget(self.timesig_combo)
+
+        self.quantize_chk = QCheckBox("Quantize")
+        header.addWidget(self.quantize_chk)
+
+        self.metronome_btn = QPushButton("Metronome")
+        self.metronome_btn.setCheckable(True)
+        header.addWidget(self.metronome_btn)
+
         header.addStretch(1)
 
         self.pause_btn = QPushButton("Pause Tab")
         self.pause_btn.setCheckable(True)
         self.clear_btn = QPushButton("Clear")
-        self.export_txt_btn = QPushButton("Export ASCII (.txt)")
-        self.export_json_btn = QPushButton("Export JSON")
+        self.export_txt_btn = QPushButton("ASCII (.txt)")
+        self.export_midi_btn = QPushButton("MIDI (.mid)")
+        self.export_xml_btn = QPushButton("MusicXML")
+        self.export_json_btn = QPushButton("JSON")
 
         header.addWidget(self.pause_btn)
         header.addWidget(self.clear_btn)
         header.addWidget(self.export_txt_btn)
+        header.addWidget(self.export_midi_btn)
+        header.addWidget(self.export_xml_btn)
         header.addWidget(self.export_json_btn)
         root.addLayout(header)
 

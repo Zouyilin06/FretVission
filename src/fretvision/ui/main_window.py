@@ -125,6 +125,9 @@ class MainWindow(QMainWindow):
         self.phone_url_btn = QPushButton("Phone URL…")
         row1.addWidget(self.phone_url_btn)
 
+        self.open_clip_btn = QPushButton("Open Clip…")
+        row1.addWidget(self.open_clip_btn)
+
         self.mirror_chk = QCheckBox("Mirror")
         self.mirror_chk.setChecked(self.config.camera.mirror)
         row1.addWidget(self.mirror_chk)
@@ -233,6 +236,25 @@ class MainWindow(QMainWindow):
         cam_lay.setContentsMargins(8, 8, 8, 8)
         self.camera_widget = CameraViewWidget()
         cam_lay.addWidget(self.camera_widget)
+
+        # Clip replay transport bar (hidden unless an offline .mp4/.wav clip is open)
+        self.clip_bar = QWidget()
+        clip_lay = QHBoxLayout(self.clip_bar)
+        clip_lay.setContentsMargins(0, 4, 0, 0)
+        clip_lay.setSpacing(6)
+        self.clip_play_btn = QPushButton("Pause")
+        self.clip_play_btn.setCheckable(True)
+        self.clip_scrub_slider = QSlider(Qt.Orientation.Horizontal)
+        self.clip_scrub_slider.setRange(0, 1000)
+        self.clip_time_lbl = QLabel("00:00 / 00:00")
+        self.clip_exit_btn = QPushButton("Exit Clip")
+        clip_lay.addWidget(self.clip_play_btn)
+        clip_lay.addWidget(self.clip_scrub_slider, 1)
+        clip_lay.addWidget(self.clip_time_lbl)
+        clip_lay.addWidget(self.clip_exit_btn)
+        self.clip_bar.setVisible(False)
+        cam_lay.addWidget(self.clip_bar)
+
         mid_row.addWidget(cam_card, 6)
 
         # Right telemetry sidebar
@@ -388,6 +410,10 @@ class MainWindow(QMainWindow):
 
         self.camera_combo.activated.connect(self._on_camera_selected)
         self.phone_url_btn.clicked.connect(self._on_phone_url_clicked)
+        self.open_clip_btn.clicked.connect(self._on_open_clip)
+        self.clip_play_btn.clicked.connect(self._on_clip_play_toggled)
+        self.clip_scrub_slider.sliderMoved.connect(self._on_clip_scrub)
+        self.clip_exit_btn.clicked.connect(self._on_clip_exit)
         self.mirror_chk.toggled.connect(self._on_orientation_changed)
         self.rotate_combo.currentIndexChanged.connect(self._on_orientation_changed)
         self.audio_combo.activated.connect(self._on_audio_selected)
@@ -415,9 +441,22 @@ class MainWindow(QMainWindow):
         self.gate_slider.valueChanged.connect(self._on_gate_changed)
         self.download_model_btn.clicked.connect(self._start_model_download)
 
+        self.tab_widget.bpm_spin.setValue(self.config.tab_bpm)
+        idx_ts = self.tab_widget.timesig_combo.findText(self.config.time_signature)
+        if idx_ts >= 0:
+            self.tab_widget.timesig_combo.setCurrentIndex(idx_ts)
+        self.tab_widget.quantize_chk.setChecked(self.config.use_quantized_tab)
+
+        self.tab_widget.bpm_spin.valueChanged.connect(self._on_tab_timing_changed)
+        self.tab_widget.timesig_combo.currentTextChanged.connect(self._on_tab_timing_changed)
+        self.tab_widget.quantize_chk.toggled.connect(self._on_tab_timing_changed)
+        self.tab_widget.metronome_btn.toggled.connect(self._on_metronome_toggled)
+
         self.tab_widget.pause_btn.toggled.connect(self.worker.set_tab_paused)
         self.tab_widget.clear_btn.clicked.connect(self.worker.clear_tab)
         self.tab_widget.export_txt_btn.clicked.connect(self._export_ascii_tab)
+        self.tab_widget.export_midi_btn.clicked.connect(self._export_midi_tab)
+        self.tab_widget.export_xml_btn.clicked.connect(self._export_musicxml_tab)
         self.tab_widget.export_json_btn.clicked.connect(self._export_json_tab)
 
     def _populate_devices(self) -> None:
@@ -623,11 +662,74 @@ class MainWindow(QMainWindow):
         else:
             hand_state = "Searching Hand"
 
-        mode_lbl = "DEMO" if snap.demo_mode else f"{snap.video_fps:.0f} FPS"
+        mode_lbl = "CLIP" if snap.clip_active else ("DEMO" if snap.demo_mode else f"{snap.video_fps:.0f} FPS")
         self.diag_lbl.setText(
             f"Neck: {snap.neck_status.value} ({snap.tracked_points} pts)  |  "
             f"{hand_state}  |  {mode_lbl}  |  Audio: {snap.audio_latency_ms:.1f} ms"
         )
+
+        self.clip_bar.setVisible(snap.clip_active)
+        if snap.clip_active:
+            self.clip_play_btn.setText("Pause" if snap.clip_playing else "Play")
+            if not self.clip_scrub_slider.isSliderDown() and snap.clip_duration_s > 0.0:
+                pos_val = int(round((snap.clip_position_s / snap.clip_duration_s) * 1000.0))
+                self.clip_scrub_slider.setValue(max(0, min(1000, pos_val)))
+            cur_m, cur_s = divmod(int(snap.clip_position_s), 60)
+            tot_m, tot_s = divmod(int(snap.clip_duration_s), 60)
+            self.clip_time_lbl.setText(f"{cur_m:02d}:{cur_s:02d} / {tot_m:02d}:{tot_s:02d}")
+
+    def _on_tab_timing_changed(self) -> None:
+        self.worker.set_tab_timing(
+            self.tab_widget.quantize_chk.isChecked(),
+            self.tab_widget.bpm_spin.value(),
+            self.tab_widget.timesig_combo.currentText(),
+        )
+
+    def _on_metronome_toggled(self, checked: bool) -> None:
+        self.worker.set_metronome(
+            checked,
+            self.tab_widget.bpm_spin.value(),
+            self.tab_widget.timesig_combo.currentText(),
+        )
+
+    def _on_open_clip(self) -> None:
+        video_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Recorded Guitar Video",
+            "",
+            "Video Files (*.mp4 *.avi *.mov *.mkv);;All Files (*.*)",
+        )
+        if not video_path:
+            return
+        audio_path: str | None = None
+        from pathlib import Path
+
+        if not Path(video_path).with_suffix(".wav").exists():
+            wav_choice, _ = QFileDialog.getOpenFileName(
+                self,
+                "Optional Paired Audio (.wav) — Cancel to use video audio/ffmpeg",
+                str(Path(video_path).parent),
+                "WAV Audio (*.wav)",
+            )
+            if wav_choice:
+                audio_path = wav_choice
+        self.demo_btn.setChecked(False)
+        self.worker.load_clip(video_path, audio_path)
+
+    def _on_clip_play_toggled(self) -> None:
+        if self._latest_snapshot is None or not self._latest_snapshot.clip_active:
+            return
+        self.worker.set_clip_playing(not self._latest_snapshot.clip_playing)
+
+    def _on_clip_scrub(self, slider_val: int) -> None:
+        if self._latest_snapshot is None or not self._latest_snapshot.clip_active:
+            return
+        target_s = (slider_val / 1000.0) * self._latest_snapshot.clip_duration_s
+        self.worker.seek_clip(target_s)
+
+    def _on_clip_exit(self) -> None:
+        self.worker.close_clip()
+        self.clip_bar.setVisible(False)
 
     def _export_ascii_tab(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -636,6 +738,29 @@ class MainWindow(QMainWindow):
         if path:
             out = self.worker.export_ascii_tab(path, self.tuning_combo.currentText())
             self.statusBar().showMessage(f"Saved ASCII tab to {out}")
+
+    def _export_midi_tab(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export MIDI File", "guitar_tab.mid", "MIDI Files (*.mid)"
+        )
+        if path:
+            out = self.worker.export_midi_tab(
+                path, self.tuning_combo.currentText(), self.tab_widget.bpm_spin.value()
+            )
+            self.statusBar().showMessage(f"Saved MIDI file to {out}")
+
+    def _export_musicxml_tab(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export MusicXML", "guitar_tab.musicxml", "MusicXML Files (*.musicxml *.xml)"
+        )
+        if path:
+            out = self.worker.export_musicxml_tab(
+                path,
+                self.tuning_combo.currentText(),
+                self.tab_widget.bpm_spin.value(),
+                self.tab_widget.timesig_combo.currentText(),
+            )
+            self.statusBar().showMessage(f"Saved MusicXML to {out}")
 
     def _export_json_tab(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
