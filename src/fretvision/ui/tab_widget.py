@@ -81,6 +81,17 @@ class _TabCanvas(QWidget):
         max_visible = max(1, int((w - left_pad - right_pad - 20.0) / col_spacing))
         visible = self._columns[-max_visible:]
 
+        # Alternating subtle measure shading for quantized bars
+        if any(c.bar_idx is not None for c in visible):
+            for idx, col in enumerate(visible):
+                if col.bar_idx is not None and (col.bar_idx % 2 == 1):
+                    cx = left_pad + 24.0 + idx * col_spacing
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QColor(255, 255, 255, 8))
+                    painter.drawRect(
+                        QRectF(cx - col_spacing * 0.5, top_y, col_spacing, staff_h)
+                    )
+
         prev_bar = visible[0].bar_idx
         for idx, col in enumerate(visible):
             cx = left_pad + 24.0 + idx * col_spacing
@@ -110,6 +121,15 @@ class _TabCanvas(QWidget):
                 painter.drawText(QRectF(cx - 24, 4, 48, 18), Qt.AlignmentFlag.AlignCenter, col.chord_label)
 
             is_latest = idx == len(visible) - 1
+            if is_latest:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(59, 130, 246, 22))
+                painter.drawRoundedRect(
+                    QRectF(cx - col_spacing * 0.42, top_y - 4, col_spacing * 0.84, staff_h + 8),
+                    6.0,
+                    6.0,
+                )
+
             painter.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
             for s_idx in col.frets:
                 token = col.format_token(s_idx)
@@ -117,7 +137,7 @@ class _TabCanvas(QWidget):
                 pill_w = max(22.0, 9.0 * len(token) + 8.0)
                 pill = QRectF(cx - pill_w * 0.5, sy - 9, pill_w, 18)
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor("#1D4ED8") if is_latest else QColor("#11161D"))
+                painter.setBrush(QColor("#2563EB") if is_latest else QColor("#11161D"))
                 painter.drawRoundedRect(pill, 4.0, 4.0)
                 painter.setPen(QColor("#FFFFFF") if is_latest else QColor("#E2E8F0"))
                 painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, token)

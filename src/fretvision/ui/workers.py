@@ -54,6 +54,8 @@ class EngineSnapshot:
     clip_position_s: float = 0.0
     clip_duration_s: float = 0.0
     clip_playing: bool = False
+    spectrum_bands: tuple[float, ...] = ()
+    neck_provider: str = "CV-FretPeriodic"
 
 
 class HandHistoryBuffer:
@@ -539,6 +541,8 @@ class ProcessingWorker(QThread):
                 audio_latency_ms=audio_ms,
                 tuning_name=self.config.profile.guitar.tuning_name,
                 demo_mode=False,
+                spectrum_bands=audio_res.spectrum_bands,
+                neck_provider=self.neural_neck.provider_name,
             )
 
     def _step_demo(self, now_s: float) -> EngineSnapshot:
@@ -645,6 +649,8 @@ class ProcessingWorker(QThread):
             audio_latency_ms=1.8,
             tuning_name="Standard (EADGBE)",
             demo_mode=True,
+            spectrum_bands=audio_res.spectrum_bands,
+            neck_provider=self.neural_neck.provider_name,
         )
 
     def _step_clip(self, now_s: float) -> EngineSnapshot:
@@ -706,4 +712,6 @@ class ProcessingWorker(QThread):
             clip_position_s=pos_s,
             clip_duration_s=clip.duration_s,
             clip_playing=clip.playing,
+            spectrum_bands=audio_res.spectrum_bands,
+            neck_provider=self.neural_neck.provider_name,
         )

@@ -10,11 +10,18 @@ from typing import Literal
 
 Handedness = Literal["right", "left"]
 NeckTrackingMode = Literal["optical_flow", "static"]
+ThemeName = Literal["dark_studio", "high_contrast"]
+FretboardLabelMode = Literal["notes", "degrees"]
 
 
 def default_profiles_dir() -> Path:
     """Return the user config directory for saved FretVision profiles."""
     return Path.home() / ".fretvision" / "profiles"
+
+
+def default_ui_state_path() -> Path:
+    """Return path to persisted window/splitter UI state."""
+    return Path.home() / ".fretvision" / "ui_state.json"
 
 
 @dataclass
@@ -93,6 +100,40 @@ class CalibrationProfile:
 
 
 @dataclass
+class UiLayoutState:
+    """Persisted splitter sizes, window geometry, and UI visual preferences."""
+
+    window_width: int = 1360
+    window_height: int = 900
+    v_splitter_sizes: list[int] | None = None
+    h_splitter_sizes: list[int] | None = None
+    theme_name: ThemeName = "dark_studio"
+    fretboard_label_mode: FretboardLabelMode = "notes"
+    setup_drawer_open: bool = False
+    stage_mode: bool = False
+
+    def save(self, path: Path | None = None) -> Path:
+        target = path or default_ui_state_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        return target
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> UiLayoutState:
+        target = path or default_ui_state_path()
+        if not target.exists():
+            return cls()
+        try:
+            raw = json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            return cls()
+        if not isinstance(raw, dict):
+            return cls()
+        valid = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in valid})
+
+
+@dataclass
 class AppConfig:
     """Top-level configuration bundle for FretVision."""
 
@@ -105,3 +146,7 @@ class AppConfig:
     use_quantized_tab: bool = False
     time_signature: str = "4/4"
     tab_subdivision: int = 8
+    theme_name: ThemeName = "dark_studio"
+    fretboard_label_mode: FretboardLabelMode = "notes"
+    setup_drawer_open: bool = False
+    stage_mode: bool = False

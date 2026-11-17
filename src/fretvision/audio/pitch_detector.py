@@ -36,6 +36,7 @@ class AudioAnalysisResult:
     is_onset: bool
     is_silent: bool
     dominant_cents: float
+    spectrum_bands: tuple[float, ...] = ()
 
 
 def yin_pitch(
@@ -258,6 +259,7 @@ class HybridHarmonicPitchDetector(PitchDetector):
             )
 
         spec = self._compute_multires_spectrum(x, sample_rate)
+        spec_bands = self._downsample_spectrum_bands(spec, n_bands=24)
         # Positive spectral flux detects both loud attacks and quiet high-string plucks over ringing bass
         is_onset = False
         if self._prev_spec is not None:
@@ -406,6 +408,7 @@ class HybridHarmonicPitchDetector(PitchDetector):
                         is_onset=is_onset,
                         is_silent=False,
                         dominant_cents=y_cents,
+                        spectrum_bands=spec_bands,
                     )
 
         # Polyphonic output from filtered NNLS weights
@@ -435,4 +438,17 @@ class HybridHarmonicPitchDetector(PitchDetector):
             is_onset=is_onset,
             is_silent=len(out_pitches) == 0,
             dominant_cents=dom_cents,
+            spectrum_bands=spec_bands,
         )
+
+    @staticmethod
+    def _downsample_spectrum_bands(spec: np.ndarray, n_bands: int = 24) -> tuple[float, ...]:
+        """Pool log-frequency spectrum into n_bands normalized [0..1] UI bars."""
+        usable = spec[: min(len(spec), 180)]  # span guitar fundamentals & primary harmonics
+        if len(usable) < n_bands:
+            return tuple([0.0] * n_bands)
+        chunks = np.array_split(usable, n_bands)
+        raw = np.array([float(np.max(c)) for c in chunks], dtype=np.float64)
+        compressed = np.log1p(18.0 * raw) / math.log1p(18.0 * 0.45)
+        clipped = np.clip(compressed, 0.0, 1.0)
+        return tuple(round(float(v), 3) for v in clipped)
